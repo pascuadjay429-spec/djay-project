@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: storm-router
+    runtime: python
+    plan: free
+    buildCommand: python -c "print('ok')"
+    startCommand: python storm_web.py
+    envVars:
+      - key: MODE
+        value: router
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: HOST
+        value: "0.0.0.0"
+      - key: ROUTER_API_SECRET
+        value: STORM-GOJI-HOOK-SECRET-OFX

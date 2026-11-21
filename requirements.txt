@@ -1,0 +1,2 @@
+# stdlib only for router/panel — no pip deps required
+# requests is only needed on the checker (own.py), not on the web hosts
