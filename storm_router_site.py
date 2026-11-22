@@ -13,7 +13,7 @@ def page(title, body, active=""):
     def L(h, l, k):
         return f'<a class="{" active" if active==k else ""}" href="{h}">{l}</a>'
     nav = ('<nav class="nav"><span class="brand">STORM × GOJI · ROUTER</span>'
-           + L("/", "Vault", "vault") + L("/monitor", "Monitor", "mon")
+           + L("/", "Vault", "vault") + L("/keys", "Keys", "keys") + L("/generate", "Generate", "gen") + L("/monitor", "Monitor", "mon")
            + L("/logout", "Logout", "") + "</nav>")
     return f"""<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -91,6 +91,8 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception: pass
                 return
             if path in ("/","/vault"): return self._vault(qs)
+            if path in ("/keys","/panel","/generate","/users"):
+                return self._panel_proxy(path, qs)
             if path=="/monitor": return self._monitor()
             if path=="/download": return self._dl(qs, False)
             if path=="/download/random": return self._dl(qs, True)
@@ -103,6 +105,7 @@ class Handler(BaseHTTPRequestHandler):
             path=urllib.parse.urlparse(self.path).path or "/"
             if path=="/login": return self._login_post()
             if path=="/api/hook": return self._hook()
+            if path=="/api/key/status": return self._key_status()
             return self._send(404, b'{"ok":false}', "application/json")
         except Exception:
             return self._send(500, b'{"ok":false}', "application/json")
@@ -226,6 +229,132 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(500, b'{"ok":false}', "application/json")
         return self._send(200, b'{"ok":true,"stored":true}', "application/json")
+
+    def _key_status(self):
+        secret = self.headers.get("X-Router-Secret") or self.headers.get("x-router-secret") or ""
+        if secret and not hmac.compare_digest(str(secret), str(S.ROUTER_API_SECRET)):
+            return self._send(403, b'{"ok":false}', "application/json")
+        data = self._json()
+        key = (data.get("key") or "").strip().upper().replace(" ", "")
+        device = (data.get("device_id") or "").strip()
+        if not key:
+            return self._send(200, b'{"ok":true,"allowed":true}', "application/json")
+        # masters always
+        if key in (S.MASTER_STORM, S.MASTER_GOJI):
+            return self._send(200, b'{"ok":true,"allowed":true,"role":"master"}', "application/json")
+        db = S.load_db()
+        if key in db.get("revoked", []):
+            return self._send(200, b'{"ok":true,"allowed":false,"reason":"revoked"}', "application/json")
+        if device and device in db.get("banned_devices", []):
+            return self._send(200, b'{"ok":true,"allowed":false,"reason":"device_banned"}', "application/json")
+        rec = db.get("keys", {}).get(key)
+        if rec is None:
+            # portable offline keys may not be in cloud DB yet — allow
+            return self._send(200, b'{"ok":true,"allowed":true,"reason":"unknown_local"}', "application/json")
+        if rec.get("banned"):
+            return self._send(200, b'{"ok":true,"allowed":false,"reason":"banned"}', "application/json")
+        exp = rec.get("expires_at")
+        if exp and S.parse_iso(exp) and S.parse_iso(exp) < S.now():
+            return self._send(200, b'{"ok":true,"allowed":false,"reason":"expired"}', "application/json")
+        try:
+            S.touch_session(key, device)
+        except Exception:
+            pass
+        return self._send(200, b'{"ok":true,"allowed":true}', "application/json")
+
+
+    def _panel_proxy(self, path, qs):
+        """Lightweight key admin on same host (Render single service)."""
+        if not self._require():
+            return
+        db = S.load_db()
+        if path == "/generate" and (qs.get("action") == ["new"] or True):
+            # show generate form via GET amount unit
+            unit = (qs.get("unit") or ["day"])[0]
+            try: amount = int((qs.get("amount") or ["1"])[0])
+            except Exception: amount = 1
+            try: max_d = int((qs.get("max_devices") or ["1"])[0])
+            except Exception: max_d = 1
+            if qs.get("go") == ["1"]:
+                expires = S.parse_duration(unit, amount)
+                key = S.make_portable_key(expires)
+                db.setdefault("keys", {})[key] = {
+                    "created_at": S.iso(S.now()), "expires_at": expires, "device_id": None,
+                    "devices": [], "max_devices": max(1, min(10, max_d)),
+                    "banned": False, "note": "", "label": "USER", "tier": "user",
+                    "max_level": 399, "portable": True, "last_seen": None,
+                }
+                S.save_db(db)
+                S.log_event("key_generate", {"key": key})
+                flash = f'<div class="flash ok mono">{S.esc(key)}</div>'
+            else:
+                flash = ""
+            body = f"""<h1>Generate</h1><section class="card">{flash}
+              <form method="get" action="/generate">
+                <input type="hidden" name="go" value="1"/>
+                <label>Unit</label><select name="unit">
+                  <option>minute</option><option>hour</option><option selected>day</option>
+                  <option>week</option><option>month</option><option>year</option><option>lifetime</option>
+                </select>
+                <label>Amount</label><input name="amount" type="number" value="1"/>
+                <label>Max devices</label><input name="max_devices" type="number" value="1"/>
+                <button class="btn-mg" type="submit">Generate</button>
+              </form></section>
+              <p class="hint"><a class="btn" href="/keys">Keys</a> <a class="btn" href="/">Vault</a></p>"""
+            return self._send(200, page("Generate", body))
+        # keys list + actions
+        msg = (qs.get("msg") or [""])[0]
+        flash = f'<div class="flash ok">{S.esc(msg)}</div>' if msg else ""
+        action = (qs.get("action") or [""])[0]
+        key_q = (qs.get("key") or [""])[0].strip().upper()
+        if action and key_q:
+            if action == "revoke":
+                if key_q not in db.get("revoked", []): db.setdefault("revoked", []).append(key_q)
+                db.get("keys", {}).pop(key_q, None)
+                S.log_event("key_revoke", {"key": key_q}); msg = "revoked"
+            elif action == "ban":
+                rec = db.get("keys", {}).get(key_q)
+                if rec:
+                    rec["banned"] = True
+                    db["keys"][key_q] = rec
+                    S.log_event("key_ban", {"key": key_q}); msg = "banned"
+            elif action == "unban":
+                rec = db.get("keys", {}).get(key_q)
+                if rec:
+                    rec["banned"] = False
+                    db["keys"][key_q] = rec
+                    msg = "unbanned"
+            elif action == "kick":
+                rec = db.get("keys", {}).get(key_q)
+                if rec:
+                    rec["device_id"] = None
+                    rec["devices"] = []
+                    db["keys"][key_q] = rec
+                    msg = "kicked"
+            S.save_db(db)
+            return self._redirect("/keys?msg=" + urllib.parse.quote(msg))
+        rows = []
+        for k, rec in list(db.get("keys", {}).items())[:300]:
+            if not isinstance(rec, dict): continue
+            st = S.session_status(rec)
+            enc = urllib.parse.quote(k, safe="")
+            rows.append(
+                f"<tr><td class='mono'>{S.esc(k)}</td><td><span class='tag'>{st}</span></td>"
+                f"<td class='muted'>{S.esc((rec.get('expires_at') or 'LIFE')[:19])}</td>"
+                f"<td class='actions'>"
+                f"<a class='btn' href='/keys?action=kick&key={enc}'>Kick</a> "
+                f"<a class='btn-bad' href='/keys?action=ban&key={enc}'>Ban</a> "
+                f"<a class='btn' href='/keys?action=unban&key={enc}'>Unban</a> "
+                f"<a class='btn-bad' href='/keys?action=revoke&key={enc}'>Revoke</a></td></tr>"
+            )
+        table = "".join(rows) or "<tr><td colspan='4' class='muted'>No keys — use Generate</td></tr>"
+        body = f"""<h1>Keys</h1>{flash}
+        <p class="hint"><a class="btn-mg" href="/generate">Generate</a> <a class="btn" href="/">Vault</a></p>
+        <section class="card"><div class="table-wrap"><table>
+          <thead><tr><th>Key</th><th>Status</th><th>Expires</th><th>Actions</th></tr></thead>
+          <tbody>{table}</tbody></table></div></section>"""
+        return self._send(200, page("Keys", body))
+
 
 def main():
     S.ensure_admin()
